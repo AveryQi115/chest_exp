@@ -1,0 +1,4 @@
+output
+*.ipynb
+.ipynb_checkpoints
+*.json
