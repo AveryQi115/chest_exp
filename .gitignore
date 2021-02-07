@@ -2,3 +2,5 @@ output
 *.ipynb
 .ipynb_checkpoints
 *.json
+__pychache__
+*/__pychache__

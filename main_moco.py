@@ -8,6 +8,7 @@ import random
 import shutil
 import time
 import warnings
+from PIL import Image
 # import cv2
 
 import torch
@@ -98,6 +99,10 @@ parser.add_argument('--aug-plus', action='store_true',
 parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 
+def pil_loader(path):
+    f = open(path,'rb')
+    img = Image.open(f)
+    return img
 
 def main():
     args = parser.parse_args()
@@ -234,6 +239,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # transforms.RandomGrayscale(p=0.2),
             moco.loader.EqualizeHist(),
             transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+            transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.05),
+                         scale=(0.95, 1.05), fillcolor=128),
+            moco.loader.Convert2RGB(),
             # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize
@@ -246,6 +254,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
             moco.loader.EqualizeHist(),
             transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+            transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.05),
+                         scale=(0.95, 1.05), fillcolor=128),
+            moco.loader.Convert2RGB(),
             # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize
@@ -256,9 +267,9 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_dataset = datasets.ImageFolder(
         traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)),loader=pil_loader)
 
-    print("successfully create dataset")
+    print(f"successfully create dataset:{len(train_dataset)}")
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -286,7 +297,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+            }, is_best=False, filename='output/checkpoint_{:04d}.pth.tar'.format(epoch))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):

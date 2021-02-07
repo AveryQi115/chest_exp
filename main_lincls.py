@@ -111,14 +111,17 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = models.__dict__[args.arch]()
-    model.conv0 = nn.Conv2d(1, 64, kernel_size=7, stride=2,
-                                padding=3, bias=False)
+    # model.features.conv0 = nn.Conv2d(1, 64, kernel_size=7, stride=2,
+    #                             padding=3, bias=False)
 
     # freeze all layers but the last fc
     for name, param in model.named_parameters():
         if name not in ['classifier.weight', 'classifier.bias']:
             param.requires_grad = False
-    # init the fc layer
+    # modify the fc layer
+    input_num = model.classifier.in_features
+    # TODO: here's a hard code num_classes
+    model.classifier = nn.Linear(input_num,5,True)
     model.classifier.weight.data.normal_(mean=0.0, std=0.01)
     model.classifier.bias.data.zero_()
 
@@ -225,8 +228,14 @@ def main_worker(gpu, ngpus_per_node, args):
                                      std=[0.5])
     train_augmentation = [
             transforms.RandomResizedCrop(320, scale=(0.08, 1.0),ratio=(0.75, 1.333333333)),
+            # transforms.RandomGrayscale(p=0.2),
+            # transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
             moco.loader.EqualizeHist(),
-            moco.loader.GaussianBlur([.1, 2.]),
+            transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+            transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.05),
+                         scale=(0.95, 1.05), fillcolor=128),
+            moco.loader.Convert2RGB(),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize
         ]
@@ -245,7 +254,8 @@ def main_worker(gpu, ngpus_per_node, args):
     valid_augmentation = [
             transforms.CenterCrop(320),
             moco.loader.EqualizeHist(),
-            moco.loader.GaussianBlur([.1, 2.]),
+            # moco.loader.GaussianBlur([.1, 2.]),
+            moco.loader.Convert2RGB(),
             transforms.ToTensor(),
             normalize
         ]
@@ -261,8 +271,14 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion) and optimizer
     criterion = BCEWithLogitsLoss(num_class_list).cuda(args.gpu)
 
+
+    test_dataset = CheXpert('test', transforms.Compose(valid_augmentation))
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
     if args.evaluate:
-        validate(val_loader, model, criterion, args, num_classes)
+        validate(test_loader, model, criterion, args, num_classes)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -274,7 +290,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args, num_classes)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args, num_classes)
+        acc1,auc_list = validate(val_loader, model, criterion, args, num_classes)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -282,13 +298,17 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
+            checkpoint_dict = {
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'best_auc': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
+            }
+            for i, auc in enumerate(auc_list):
+                checkpoint_dict['auc'+str(i)] = auc
+
+            save_checkpoint(checkpoint_dict, is_best)
             if epoch == args.start_epoch:
                 sanity_check(model.state_dict(), args.pretrained)
 
@@ -384,12 +404,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args, num_classes):
         if i % args.print_freq == 0:
             progress.display(i)
 
-    pbar_str = "---Epoch:{:>3d}    Epoch_Auc:{:>5.2f}---".format(
+    pbar_str = "---Epoch:{:>3d}    Epoch_Auc:{:>5.5f}---".format(
             epoch, roc_auc.compute()
     )
     print(pbar_str)
     for j in range(num_classes):
-        pbar_str = "-------Epoch:{:>3d}  Category_id:{:>3d}   Valid_Auc:{:>5.2f}%-------".format(
+        pbar_str = "-------Epoch:{:>3d}  Category_id:{:>3d}   Valid_Auc:{:>5.5f}-------".format(
             epoch, j, roc_auc_list[j].compute()
         )
         print(pbar_str)
@@ -436,17 +456,20 @@ def validate(val_loader, model, criterion, args,num_classes):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        pbar_str = "---Epoch:{:>3d}    Epoch_Auc:{:>5.2f}---".format(
-            epoch, roc_auc.compute()
+        auc_list = []
+        pbar_str = "---Valid--Epoch_Auc:{:>5.5f}---".format(
+            roc_auc.compute()
         )
         print(pbar_str)
         for j in range(num_classes):
-            pbar_str = "-------Epoch:{:>3d}  Category_id:{:>3d}   Valid_Auc:{:>5.2f}%-------".format(
-                epoch, j, roc_auc_list[j].compute()
+            auc_temp = roc_auc_list[j].compute()
+            auc_list.append(auc_temp)
+            pbar_str = "-------Valid--Category_id:{:>3d}   Valid_Auc:{:>5.5f}-------".format(
+                j, auc_temp
             )
             print(pbar_str)
 
-    return roc_auc.compute()
+    return roc_auc.compute(),auc_list
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

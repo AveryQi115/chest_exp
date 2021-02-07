@@ -10,8 +10,9 @@ class CFG():
     def __init__(self):
         self.DATASET_UNCERTAIN = "U-positive"
         self.INPUT_SIZE = (320,320)
-        self.DATASET_TRAIN_JSON = "chexpert_moco_train.json"
+        self.DATASET_TRAIN_JSON = "chexpert_moco_train_patients.json"
         self.DATASET_VALID_JSON = "chexpert_moco_valid.json"
+        self.DATASET_TEST_JSON = "chexpert_moco_test_patients.json"
 
 class CheXpert(Dataset):
     def __init__(self, mode='train', transform=None,cfg=CFG()):
@@ -28,6 +29,9 @@ class CheXpert(Dataset):
         elif "valid" in self.mode:
             print("Loading valid data ...")
             self.json_path = cfg.DATASET_VALID_JSON
+        elif "test" in self.mode:
+            print("Loading test data ...")
+            self.json_path = cfg.DATASET_TEST_JSON
 
         with open(self.json_path, "r") as f:
             self.all_info = json.load(f)

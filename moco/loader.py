@@ -1,7 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-from PIL import ImageFilter, ImageOps
+from PIL import ImageFilter, ImageOps,Image
 import random
 import cv2
+import numpy as np
 
 
 class TwoCropsTransform:
@@ -31,5 +32,11 @@ class EqualizeHist(object):
 
     def __call__(self, x):
         x = ImageOps.equalize(x)
+        return x
+
+class Convert2RGB(object):
+    
+    def __call__(self,x):
+        x = x.convert('RGB')
         return x
 

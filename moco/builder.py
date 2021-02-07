@@ -25,11 +25,12 @@ class MoCo(nn.Module):
         # num_classes is the output fc dimension
 
         # assume base_encoder is densenet121
-        base_encoder.conv0 = nn.Conv2d(1, 64, kernel_size=7, stride=2,
-                                padding=3, bias=False)
-
         self.encoder_q = base_encoder(num_classes=dim)
+        # self.encoder_q.features.conv0 = nn.Conv2d(1, 64, kernel_size=7, stride=2,
+                                # padding=3, bias=False)
         self.encoder_k = base_encoder(num_classes=dim)
+        # self.encoder_k.features.conv0 = nn.Conv2d(1, 64, kernel_size=7, stride=2,
+                                # padding=3, bias=False)
 
         if mlp:  # hack: brute-force replacement
             dim_mlp = self.encoder_q.fc.weight.shape[1]
@@ -62,7 +63,7 @@ class MoCo(nn.Module):
         batch_size = keys.shape[0]
 
         ptr = int(self.queue_ptr)
-        assert self.K % batch_size == 0  # for simplicity
+        assert self.K % batch_size == 0,f'{self.K},{batch_size}' # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
         self.queue[:, ptr:ptr + batch_size] = keys.T

@@ -46,6 +46,7 @@ class BCEWithLogitsLoss(nn.Module):
         # output.size = (batchsize, num_classes)
         # pos_weight.size = (num_classes,)
         num_classes = output.shape[1]
+        assert num_classes == 5,f'{output.shape}'
         
         # TODO: num_class_list
         pos_weight = torch.from_numpy(
