@@ -99,6 +99,9 @@ parser.add_argument('--aug-plus', action='store_true',
 parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 
+parser.add_argument('--store-path', default='output/',type=str,
+                    help="checkpoint store path prefix")
+
 def pil_loader(path):
     f = open(path,'rb')
     img = Image.open(f)
@@ -232,6 +235,7 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.aug_plus:
         # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
         augmentation = [
+            moco.loader.Convert2RGB(),
             transforms.RandomResizedCrop(320, scale=(0.08, 1.0),ratio=(0.75, 1.333333333)),
             # transforms.RandomApply([
                 # transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
@@ -241,7 +245,6 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
             transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.05),
                          scale=(0.95, 1.05), fillcolor=128),
-            moco.loader.Convert2RGB(),
             # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize
@@ -249,6 +252,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
         augmentation = [
+            moco.loader.Convert2RGB(),
             transforms.RandomResizedCrop(320, scale=(0.08, 1.0),ratio=(0.75, 1.333333333)),
             # transforms.RandomGrayscale(p=0.2),
             # transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
@@ -256,7 +260,6 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
             transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.05),
                          scale=(0.95, 1.05), fillcolor=128),
-            moco.loader.Convert2RGB(),
             # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize
@@ -297,7 +300,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='output/checkpoint_{:04d}.pth.tar'.format(epoch))
+            }, is_best=False, filename=(args.store_path + 'checkpoint_{:04d}.pth.tar').format(epoch))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):

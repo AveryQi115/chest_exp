@@ -7,7 +7,7 @@ import random
 import shutil
 import time
 import warnings
-from dataset import CheXpert
+from dataset import CheXpert, ChestRay
 from loss import BCEWithLogitsLoss, get_category_list
 import moco.loader
 from ignite.contrib.metrics import ROC_AUC
@@ -83,7 +83,12 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 
 parser.add_argument('--pretrained', default='', type=str,
                     help='path to moco pretrained checkpoint')
+parser.add_argument('--dataset',default='CheXpert', type=str, help="choose which dataset is trained")
 
+parser.add_argument('--store-path', type=str, default='output/', help="path to store checkpoint and best model")
+
+parser.add_argument('-f', '--finetune',dest='finetune',
+                    help='unfreeze weight layers')
 best_acc1 = 0
 
 def main_worker(gpu, ngpus_per_node, args):
@@ -115,13 +120,18 @@ def main_worker(gpu, ngpus_per_node, args):
     #                             padding=3, bias=False)
 
     # freeze all layers but the last fc
-    for name, param in model.named_parameters():
-        if name not in ['classifier.weight', 'classifier.bias']:
-            param.requires_grad = False
+    if not args.finetune:
+        for name, param in model.named_parameters():
+            if name not in ['classifier.weight', 'classifier.bias']:
+                param.requires_grad = False
+                
     # modify the fc layer
     input_num = model.classifier.in_features
     # TODO: here's a hard code num_classes
-    model.classifier = nn.Linear(input_num,5,True)
+    if args.dataset == 'CheXpert':
+        model.classifier = nn.Linear(input_num,5,True)
+    elif args.dataset == 'ChestRay':
+        model.classifier = nn.Linear(input_num,14,True)
     model.classifier.weight.data.normal_(mean=0.0, std=0.01)
     model.classifier.bias.data.zero_()
 
@@ -180,7 +190,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # optimize only the linear classifier
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
-    assert len(parameters) == 2  # fc.weight, fc.bias
+    # assert len(parameters) == 2  # fc.weight, fc.bias
     optimizer = torch.optim.SGD(parameters, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -196,12 +206,12 @@ def main_worker(gpu, ngpus_per_node, args):
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
             args.start_epoch = checkpoint['epoch']
-            best_acc1 = checkpoint['best_acc1']
-            if args.gpu is not None:
+            best_acc1 = checkpoint['best_auc']
+            if args.gpu is not None and type(best_acc1) != float:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
             model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            # optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -230,16 +240,16 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.RandomResizedCrop(320, scale=(0.08, 1.0),ratio=(0.75, 1.333333333)),
             # transforms.RandomGrayscale(p=0.2),
             # transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
+            moco.loader.Convert2RGB(),
             moco.loader.EqualizeHist(),
             transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
             transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.05),
                          scale=(0.95, 1.05), fillcolor=128),
-            moco.loader.Convert2RGB(),
             # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize
         ]
-    train_dataset = CheXpert('train', transforms.Compose(train_augmentation))
+    train_dataset = eval(args.dataset)('train', transforms.Compose(train_augmentation))
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -252,14 +262,14 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # valid dataset
     valid_augmentation = [
+            moco.loader.Convert2RGB(),
             transforms.CenterCrop(320),
             moco.loader.EqualizeHist(),
             # moco.loader.GaussianBlur([.1, 2.]),
-            moco.loader.Convert2RGB(),
             transforms.ToTensor(),
             normalize
         ]
-    val_dataset = CheXpert('valid', transforms.Compose(valid_augmentation))
+    val_dataset = eval(args.dataset)('valid', transforms.Compose(valid_augmentation))
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=args.batch_size, shuffle=False,
@@ -272,7 +282,7 @@ def main_worker(gpu, ngpus_per_node, args):
     criterion = BCEWithLogitsLoss(num_class_list).cuda(args.gpu)
 
 
-    test_dataset = CheXpert('test', transforms.Compose(valid_augmentation))
+    test_dataset = eval(args.dataset)('test', transforms.Compose(valid_augmentation))
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=args.batch_size, shuffle=False,
@@ -308,8 +318,8 @@ def main_worker(gpu, ngpus_per_node, args):
             for i, auc in enumerate(auc_list):
                 checkpoint_dict['auc'+str(i)] = auc
 
-            save_checkpoint(checkpoint_dict, is_best)
-            if epoch == args.start_epoch:
+            save_checkpoint(checkpoint_dict, is_best, args.store_path+'checkpoint.pth.tar')
+            if epoch == args.start_epoch and not args.finetune:
                 sanity_check(model.state_dict(), args.pretrained)
 
 def main():
@@ -387,6 +397,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, num_classes):
         loss = criterion(args, output, target)
 
         roc_auc.update((output.data,target.data))
+        assert output.shape[1] ==num_classes,f'{output.shape}'
         for j in range(num_classes):
             roc_auc_list[j].update((output.data[:,j],target.data[:,j]))
 
@@ -475,7 +486,7 @@ def validate(val_loader, model, criterion, args,num_classes):
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, '/'.join(filename.split('/')[:-1])+'/model_best.pth.tar')
 
 
 def sanity_check(state_dict, pretrained_weights):
