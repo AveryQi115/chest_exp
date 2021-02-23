@@ -42,7 +42,7 @@ class BCEWithLogitsLoss(nn.Module):
         super(BCEWithLogitsLoss, self).__init__()
         self.num_class_list = num_class_list
 
-    def forward(self, args, output, target):
+    def forward(self, args, output, target, reduction='sum'):
         # output.size = (batchsize, num_classes)
         # pos_weight.size = (num_classes,)
         num_classes = output.shape[1]
@@ -58,6 +58,49 @@ class BCEWithLogitsLoss(nn.Module):
         loss_list = []
         for i in range(num_classes):
             target_i = target[:, i].view(-1)
-            loss_list.append(F.binary_cross_entropy_with_logits(output[:,i].view(-1), target_i,pos_weight[i]))
-        loss = torch.sum(torch.stack(loss_list))
-        return loss
+            if reduction == 'expand':
+                loss_list.append(F.binary_cross_entropy_with_logits(output[:,i].view(-1), target_i,pos_weight[i],reduction='none'))
+            else:
+                loss_list.append(F.binary_cross_entropy_with_logits(output[:,i].view(-1), target_i,pos_weight[i]))
+
+        if reduction=='sum':
+            loss = torch.sum(torch.stack(loss_list))
+            return loss
+        elif reduction=='expand':
+            return torch.stack(loss_list,dim=1)
+        else:
+            return loss_list
+
+
+def consistency_loss(args, logits_w, logits_s, criterion, p_cutoff_pos, p_cutoff_neg, name='BCE', T=1.0, use_hard_labels=True):
+    assert name in ['ce', 'L2','BCE']
+    logits_w = logits_w.detach()
+    if name == 'L2':
+        assert logits_w.size() == logits_s.size()
+        return F.mse_loss(logits_s, logits_w, reduction='mean')
+    
+    elif name == 'L2_mask':
+        pass
+
+    elif name == 'BCE':
+        pseudo_label = torch.sigmoid(logits_w)
+        # assert pseudo_label.size()[1] == 14,f'{pseudo_label.size()}'
+        hard_label = torch.zeros(pseudo_label.size()).cuda(args.gpu)
+        mask = torch.zeros(pseudo_label.size()).cuda(args.gpu)
+
+        for i,(p_cutoff_pos_i,p_cutoff_neg_i) in enumerate(zip(p_cutoff_pos,p_cutoff_neg)):
+            positive = pseudo_label[:,i].ge(p_cutoff_pos_i).bool()
+            negative = pseudo_label[:,i].le(p_cutoff_neg_i).bool()
+            mask[:,i] = torch.add(positive.float(),negative.float())
+            hard_label[:,i][positive] = 1.0
+
+        if use_hard_labels:
+            masked_loss = criterion(args, logits_s, hard_label, reduction='expand') * mask
+            return masked_loss.mean(dim=0).sum(), mask.mean()
+        else:
+            pseudo_label = torch.sigmoid(logits_w/T)
+            masked_loss = criterion(args, logits_s, pseudo_label, reduction='expand') * mask
+            return masked_loss.mean(dim=0).sum(), mask.mean()
+
+    else:
+        assert Exception('Not Implemented consistency_loss')

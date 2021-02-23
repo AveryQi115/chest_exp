@@ -7,10 +7,13 @@ import random
 import shutil
 import time
 import warnings
-from dataset import CheXpert, ChestRay
+import logging
+from dataset import CheXpert, ChestRay, get_data_loader
+from fixmatch import FixMatch
 from loss import BCEWithLogitsLoss, get_category_list
 import moco.loader
 from ignite.contrib.metrics import ROC_AUC
+from train_utils import get_logger,TBLog, get_SGD,get_cosine_schedule_with_warmup
 
 import torch
 import torch.nn as nn
@@ -89,6 +92,37 @@ parser.add_argument('--store-path', type=str, default='output/', help="path to s
 
 parser.add_argument('-f', '--finetune',dest='finetune',
                     help='unfreeze weight layers')
+
+parser.add_argument('--fixmatch',action='store_true', help="use fixmatch to finetune the model and treat the trainset as unlabeled")
+
+parser.add_argument('--uratio',type=float,default = 9.0,help="the number of unlabeled data to labeled data,9 is for 10% traindata")
+
+parser.add_argument('--num_train_iter', type=int, default=2**20, 
+                        help='total number of training iterations')
+
+parser.add_argument('--train_sampler', type=str, default='RandomSampler')
+    
+parser.add_argument('--num_workers', type=int, default=1)
+
+parser.add_argument('--hard_label', type=bool, default=True)
+
+parser.add_argument('--T', type=float, default=0.5)
+
+parser.add_argument('--ema_m', type=float, default=0.999, help='ema momentum for eval_model')
+
+parser.add_argument('--p_cutoff_pos', default=[0.95,0.95,0.95,0.95,0.95], nargs='*', type=float,
+                    help='positive cutoff value for five classes')
+
+parser.add_argument('--p_cutoff_neg', default=[0.2,0.2,0.2,0.2,0.2], nargs='*', type=float,
+                    help='negative cutoff value for five classes')
+
+parser.add_argument('--ulb_loss_ratio', type=float, default=1.0)
+
+parser.add_argument('--num_eval_iter', type=int, default=10000,
+                        help='evaluation frequency')
+
+parser.add_argument('--amp', action='store_true', help='use mixed precision training or not')
+
 best_acc1 = 0
 
 def main_worker(gpu, ngpus_per_node, args):
@@ -219,21 +253,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    # Data loading code
-    # traindir = os.path.join(args.data, 'train')
-    # valdir = os.path.join(args.data, 'val')
-    # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-    #                                  std=[0.229, 0.224, 0.225])
-
-    # train_dataset = datasets.ImageFolder(
-    #     traindir,
-    #     transforms.Compose([
-    #         transforms.RandomResizedCrop(224),
-    #         transforms.RandomHorizontalFlip(),
-    #         transforms.ToTensor(),
-    #         normalize,
-    #     ]))
-
     normalize = transforms.Normalize(mean=[0.5],
                                      std=[0.5])
     train_augmentation = [
@@ -249,17 +268,6 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize
         ]
-    train_dataset = eval(args.dataset)('train', transforms.Compose(train_augmentation))
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
     # valid dataset
     valid_augmentation = [
             moco.loader.Convert2RGB(),
@@ -269,58 +277,174 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize
         ]
-    val_dataset = eval(args.dataset)('valid', transforms.Compose(valid_augmentation))
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
 
-    num_classes = train_dataset.get_num_classes()
-    annotations = train_dataset.get_annotations()
-    num_class_list, _ = get_category_list(annotations,num_classes) 
-    # define loss function (criterion) and optimizer
-    criterion = BCEWithLogitsLoss(num_class_list).cuda(args.gpu)
+    # train fixmatch load labeled_data, unlabeled_data, eval_data 
+    if args.fixmatch:
 
+        #SET save_path and logger
+        save_path = args.store_path
+        logger_level = "WARNING"
+        tb_log = None
+        if args.rank % ngpus_per_node == 0:
+            tb_log = TBLog(save_path, 'tensorboard')
+            logger_level = "INFO"
+        
+        logger = get_logger('logs', save_path, logger_level)
+        logger.warning(f"USE GPU: {args.gpu} for training")
 
-    test_dataset = eval(args.dataset)('test', transforms.Compose(valid_augmentation))
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
-    if args.evaluate:
-        validate(test_loader, model, criterion, args, num_classes)
-        return
+        weak_augmentation = [
+                transforms.RandomResizedCrop(320, scale=(0.08, 1.0),ratio=(0.75, 1.333333333)),
+                moco.loader.Convert2RGB(),
+                moco.loader.EqualizeHist(),
+                transforms.ToTensor(),
+                normalize
+            ]
+        
+        labeled_train_dataset = eval(args.dataset)('train', transforms.Compose(train_augmentation),fixmatch = args.fixmatch,weak_transform = transforms.Compose(weak_augmentation))
+        unlabeled_train_dataset = eval(args.dataset)('unlabeled', transforms.Compose(train_augmentation),fixmatch = args.fixmatch,weak_transform = transforms.Compose(weak_augmentation))
+        test_dataset = eval(args.dataset)('test', transforms.Compose(valid_augmentation))
+        
+        loader_dict = {}
+        dset_dict = {'train_lb': labeled_train_dataset, 'train_ulb': unlabeled_train_dataset, 'eval': test_dataset}
+        
+        loader_dict['train_lb'] = get_data_loader(dset_dict['train_lb'],
+                                                args.batch_size,
+                                                data_sampler = args.train_sampler,
+                                                num_iters=args.num_train_iter,
+                                                num_workers=args.num_workers, 
+                                                distributed=args.distributed)
+        
+        loader_dict['train_ulb'] = get_data_loader(dset_dict['train_ulb'],
+                                                args.batch_size*args.uratio,
+                                                data_sampler = args.train_sampler,
+                                                num_iters=args.num_train_iter,
+                                                num_workers=4*args.num_workers,
+                                                distributed=args.distributed)
+        
+        loader_dict['eval'] = get_data_loader(dset_dict['eval'],
+                                            args.batch_size,
+                                            num_workers=args.num_workers)
+    
+        num_classes = labeled_train_dataset.get_num_classes()
+        annotations = labeled_train_dataset.get_annotations()
+        labeled_num_class_list, _ = get_category_list(annotations,num_classes) 
+        # define loss function (criterion) and optimizer
+        labeled_criterion = BCEWithLogitsLoss(labeled_num_class_list).cuda(args.gpu)
 
-    for epoch in range(args.start_epoch, args.epochs):
+        annotations = labeled_train_dataset.get_annotations()
+        unlabeled_num_class_list, _ = get_category_list(annotations,num_classes) 
+        # define loss function (criterion) and optimizer
+        unlabeled_criterion = BCEWithLogitsLoss(unlabeled_num_class_list).cuda(args.gpu)
+    
+    # normal train load train_data,valid_data,test_data
+    else:
+        train_dataset = eval(args.dataset)('train', transforms.Compose(train_augmentation))
+
         if args.distributed:
-            train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        else:
+            train_sampler = None
 
-        # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args, num_classes)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        
+        val_dataset = eval(args.dataset)('valid', transforms.Compose(valid_augmentation))
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
 
-        # evaluate on validation set
-        acc1,auc_list = validate(val_loader, model, criterion, args, num_classes)
+        test_dataset = eval(args.dataset)('test', transforms.Compose(valid_augmentation))
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
 
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+        num_classes = train_dataset.get_num_classes()
+        annotations = train_dataset.get_annotations()
+        num_class_list, _ = get_category_list(annotations,num_classes) 
+        # define loss function (criterion) and optimizer
+        criterion = BCEWithLogitsLoss(num_class_list).cuda(args.gpu)
+        if args.evaluate:
+            validate(test_loader, model, criterion, args, num_classes)
+            return
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            checkpoint_dict = {
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'best_auc': best_acc1,
-                'optimizer' : optimizer.state_dict(),
-            }
-            for i, auc in enumerate(auc_list):
-                checkpoint_dict['auc'+str(i)] = auc
+    if not args.fixmatch:
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, epoch, args)
 
-            save_checkpoint(checkpoint_dict, is_best, args.store_path+'checkpoint.pth.tar')
-            if epoch == args.start_epoch and not args.finetune:
-                sanity_check(model.state_dict(), args.pretrained)
+            # train for one epoch
+            train(train_loader, model, criterion, optimizer, epoch, args, num_classes)
+
+            # evaluate on validation set
+            acc1,auc_list = validate(val_loader, model, criterion, args, num_classes)
+
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
+
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                checkpoint_dict = {
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'best_auc': best_acc1,
+                    'optimizer' : optimizer.state_dict(),
+                }
+                for i, auc in enumerate(auc_list):
+                    checkpoint_dict['auc'+str(i)] = auc
+
+                save_checkpoint(checkpoint_dict, is_best, args.store_path+'checkpoint.pth.tar')
+                if epoch == args.start_epoch and not args.finetune:
+                    sanity_check(model.state_dict(), args.pretrained)
+    else:
+        # SET FixMatch: class FixMatch in models.fixmatch
+        # TODO: backbone bn_momentum should be set by ema_m
+        # args.bn_momentum = 1.0 - args.ema_m
+        
+        # SET Optimizer & LR Scheduler
+        ## construct SGD and cosine lr scheduler
+        optimizer = get_SGD(model, 'SGD', args.lr, args.momentum, args.weight_decay)
+        scheduler = get_cosine_schedule_with_warmup(optimizer,
+                                                args.num_train_iter,
+                                                num_warmup_steps=args.num_train_iter*0)
+
+        fixmatch_model = FixMatch(model,
+                        num_classes,
+                        args.ema_m,
+                        args.T,
+                        args.p_cutoff_pos,
+                        args.p_cutoff_neg,
+                        args.ulb_loss_ratio,
+                        labeled_criterion,
+                        unlabeled_criterion,
+                        args.hard_label,
+                        num_eval_iter=args.num_eval_iter,
+                        tb_log=tb_log,
+                        logger=logger)
+
+        ## set SGD and cosine lr on FixMatch 
+        fixmatch_model.set_optimizer(optimizer, scheduler)
+
+        ## set DataLoader on FixMatch
+        fixmatch_model.set_data_loader(loader_dict)
+
+        # START TRAINING of FixMatch
+        trainer = fixmatch_model.train
+        for epoch in range(args.epochs):
+            trainer(args, logger=logger)
+            
+        if not args.multiprocessing_distributed or \
+                    (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
+            fixmatch_model.save_model('latest_model.pth', args.store_path)
+            
+        logging.warning(f"GPU {args.rank} training is FINISHED")
+
+
 
 def main():
     args = parser.parse_args()
@@ -355,7 +479,6 @@ def main():
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
-
 
 def train(train_loader, model, criterion, optimizer, epoch, args, num_classes):
     batch_time = AverageMeter('Time', ':6.3f')
