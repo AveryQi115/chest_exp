@@ -8,6 +8,7 @@ import os
 import contextlib
 from ignite.contrib.metrics import ROC_AUC
 from loss import consistency_loss
+import copy
 
 def activated_output_transform(output):
     y_pred, y = output
@@ -45,7 +46,7 @@ class FixMatch:
         # other configs are covered in main.py
         
         self.train_model = net 
-        self.eval_model = net
+        self.eval_model = copy.deepcopy(net)
         self.num_eval_iter = num_eval_iter
         self.t_fn = T #temperature params function
         self.p_fn_pos = p_cutoff_pos #confidence cutoff function
