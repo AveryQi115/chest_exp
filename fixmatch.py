@@ -9,6 +9,7 @@ import contextlib
 from ignite.contrib.metrics import ROC_AUC
 from loss import consistency_loss
 import copy
+import numpy as np
 
 def activated_output_transform(output):
     y_pred, y = output
@@ -46,7 +47,7 @@ class FixMatch:
         # other configs are covered in main.py
         
         self.train_model = net 
-        self.eval_model = copy.deepcopy(net)
+        self.eval_model = net
         self.num_eval_iter = num_eval_iter
         self.t_fn = T #temperature params function
         self.p_fn_pos = p_cutoff_pos #confidence cutoff function
@@ -66,11 +67,12 @@ class FixMatch:
         self.logger = logger
         self.print_fn = print if logger is None else logger.info
         
-        for param_q, param_k in zip(self.train_model.parameters(), self.eval_model.parameters()):
-            param_k.data.copy_(param_q.detach().data)  # initialize
-            param_k.requires_grad = False  # not update by gradient for eval_net
-            
-        self.eval_model.eval()
+        # TODO: we don't use ema now so comment this code block
+        # for param_q, param_k in zip(self.train_model.parameters(), self.eval_model.parameters()):
+        #     param_k.data.copy_(param_q.detach().data)  # initialize
+        #     param_k.requires_grad = False  # not update by gradient for eval_net
+        #
+        # self.eval_model.eval()
             
             
     @torch.no_grad()
@@ -133,12 +135,17 @@ class FixMatch:
             
             x_lb, x_ulb_w, x_ulb_s = x_lb.cuda(args.gpu), x_ulb_w.cuda(args.gpu), x_ulb_s.cuda(args.gpu)
             y_lb = y_lb.cuda(args.gpu)
-            
+            inputs = torch.cat((x_lb, x_ulb_w, x_ulb_s))
+
+            # self.print_fn(f'{self.it}: concat data done')
+
             # inference and calculate sup/unsup losses
             with amp_cm():
-                logits_x_lb = self.train_model(x_lb)
-                logits_x_ulb_w = self.train_model(x_ulb_w)
-                logits_x_ulb_s = self.train_model(x_ulb_s)
+                logits = self.train_model(inputs)
+                logits_x_lb = logits[:num_lb]
+                logits_x_ulb_w, logits_x_ulb_s = logits[num_lb:].chunk(2)
+                del logits
+                # self.print_fn(f'{self.it}: get logits output done')
 
                 # hyper-params for update
                 T = self.t_fn
@@ -146,6 +153,8 @@ class FixMatch:
                 p_cutoff_neg = self.p_fn_neg
 
                 sup_loss = self.labeled_criterion(args, logits_x_lb, y_lb)
+                # self.print_fn(f'{self.it}: get supervised loss done')
+
                 unsup_loss, mask = consistency_loss(args,
                                                 logits_x_ulb_w, 
                                                 logits_x_ulb_s,
@@ -155,6 +164,8 @@ class FixMatch:
                                                 'BCE', T, 
                                                use_hard_labels=args.hard_label)
 
+                # self.print_fn(f'{self.it}: get unsupervised loss done')                               
+
                 total_loss = sup_loss + self.lambda_u * unsup_loss
             
             # parameter updates
@@ -162,18 +173,23 @@ class FixMatch:
                 scaler.scale(total_loss).backward()
                 scaler.step(self.optimizer)
                 scaler.update()
+                # self.print_fn(f'{self.it}: use amp and update done')
             else:
                 total_loss.backward()
+                # self.print_fn(f'{self.it}: backward done')
                 self.optimizer.step()
                 
             self.scheduler.step()
             self.train_model.zero_grad()
             
-            with torch.no_grad():
-                self._eval_model_update()
+            # TODO: we don't use ema so commtent this code block
+            # with torch.no_grad():
+            #     self._eval_model_update()
+                # self.print_fn(f'{self.it}: eval model done')
             
             end_run.record()
             torch.cuda.synchronize()
+            # self.print_fn(f'{self.it}: synchronize done')
             
             #tensorboard_dict update
             tb_dict = {}
@@ -187,7 +203,8 @@ class FixMatch:
             
             
             if self.it % self.num_eval_iter == 0:
-                eval_dict = self.evaluate(args=args)
+                eval_dict,auc_dict = self.evaluate(args=args)
+                # self.print_fn(f'{self.it}: evaluate model done')
                 tb_dict.update(eval_dict)
                 
                 save_path = args.store_path
@@ -196,8 +213,8 @@ class FixMatch:
                     best_eval_acc = tb_dict['eval/auc']
                     best_it = self.it
                 
-                self.print_fn(f"{self.it} iteration, USE_EMA: {hasattr(self, 'eval_model')}, {tb_dict}, BEST_EVAL_ACC: {best_eval_acc}, at {best_it} iters")
-                self.print_fn(f"AUC_list:{tb_dict['eval/auc_list']}")
+                self.print_fn(f"{self.it:3} iteration,  SUP_LOSS:{tb_dict['train/sup_loss']:6.4f}, UNSUP_LOSS:{tb_dict['train/unsup_loss']:6.4f}, MASK_RATIO:{tb_dict['train/mask_ratio']}, BEST_EVAL_ACC: {best_eval_acc}, at {best_it} iters")
+                self.print_fn(f"AUC_list:{auc_dict['eval/auc_list']}")
 
             if not args.multiprocessing_distributed or \
                     (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
@@ -214,17 +231,21 @@ class FixMatch:
             if self.it > 2**19:
                 self.num_eval_iter = 1000
         
-        eval_dict = self.evaluate(args=args)
+        eval_dict, _ = self.evaluate(args=args)
         eval_dict.update({'eval/best_auc': best_eval_acc, 'eval/best_it': best_it})
         return eval_dict
             
             
     @torch.no_grad()
     def evaluate(self, eval_loader=None, args=None):
-        use_ema = hasattr(self, 'eval_model')
-        
-        eval_model = self.eval_model if use_ema else self.train_model
+        # TODO: we don't use ema so commtent this code block
+        # use_ema = hasattr(self, 'eval_model')
+        # self.print_fn(f'{self.it}: use_ema:{use_ema}')
+        # 
+        # eval_model = self.eval_model if use_ema else self.train_model
+        eval_model = self.eval_model
         eval_model.eval()
+        # self.print_fn(f'{self.it}: model evaluate done')
         if eval_loader is None:
             eval_loader = self.loader_dict['eval']
         
@@ -242,8 +263,10 @@ class FixMatch:
             num_batch = x.shape[0]
             total_num += num_batch
             logits = eval_model(x)
+            # self.print_fn(f'{self.it}:get logits for eval_model done')
             
             loss = self.labeled_criterion(args, logits, y)
+            # self.print_fn(f'{self.it}:labeled_criterion done')
             
             roc_auc.update((logits.data,y.data))
             for j in range(self.num_classes):
@@ -251,10 +274,11 @@ class FixMatch:
             
             total_loss += loss.detach()*num_batch
         
-        if not use_ema:
-            eval_model.train()
+        # TODO: we don't use ema so commtent this code block
+        # if not use_ema:
+        eval_model.train()
             
-        return {'eval/loss': total_loss/total_num, 'eval/auc': roc_auc.compute(),'eval/auc_list':roc_auc_list}
+        return {'eval/loss': total_loss/total_num, 'eval/auc': roc_auc.compute()},{'eval/auc_list':np.array([x.compute() for x in roc_auc_list])}
     
     
     def save_model(self, save_name, save_path):

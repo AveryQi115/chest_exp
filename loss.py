@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 from torch.autograd import Variable
+# import ipdb
 
 
 def get_category_list(annotations, num_classes):
@@ -83,6 +84,7 @@ def consistency_loss(args, logits_w, logits_s, criterion, p_cutoff_pos, p_cutoff
         pass
 
     elif name == 'BCE':
+        # ipdb.set_trace()
         pseudo_label = torch.sigmoid(logits_w)
         # assert pseudo_label.size()[1] == 14,f'{pseudo_label.size()}'
         hard_label = torch.zeros(pseudo_label.size()).cuda(args.gpu)

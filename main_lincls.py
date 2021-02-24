@@ -14,6 +14,7 @@ from loss import BCEWithLogitsLoss, get_category_list
 import moco.loader
 from ignite.contrib.metrics import ROC_AUC
 from train_utils import get_logger,TBLog, get_SGD,get_cosine_schedule_with_warmup
+# import ipdb
 
 import torch
 import torch.nn as nn
@@ -122,6 +123,9 @@ parser.add_argument('--num_eval_iter', type=int, default=10000,
                         help='evaluation frequency')
 
 parser.add_argument('--amp', action='store_true', help='use mixed precision training or not')
+
+parser.add_argument('--eval_batch_size', type=int, default=256,
+                        help='batch size of evaluation data loader (it does not affect the accuracy)')
 
 best_acc1 = 0
 
@@ -302,7 +306,7 @@ def main_worker(gpu, ngpus_per_node, args):
         
         labeled_train_dataset = eval(args.dataset)('train', transforms.Compose(train_augmentation),fixmatch = args.fixmatch,weak_transform = transforms.Compose(weak_augmentation))
         unlabeled_train_dataset = eval(args.dataset)('unlabeled', transforms.Compose(train_augmentation),fixmatch = args.fixmatch,weak_transform = transforms.Compose(weak_augmentation))
-        test_dataset = eval(args.dataset)('test', transforms.Compose(valid_augmentation))
+        test_dataset = eval(args.dataset)('valid', transforms.Compose(valid_augmentation))
         
         loader_dict = {}
         dset_dict = {'train_lb': labeled_train_dataset, 'train_ulb': unlabeled_train_dataset, 'eval': test_dataset}
@@ -322,7 +326,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                 distributed=args.distributed)
         
         loader_dict['eval'] = get_data_loader(dset_dict['eval'],
-                                            args.batch_size,
+                                            args.eval_batch_size,
                                             num_workers=args.num_workers)
     
         num_classes = labeled_train_dataset.get_num_classes()
@@ -413,6 +417,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                                 args.num_train_iter,
                                                 num_warmup_steps=args.num_train_iter*0)
 
+        # ipdb.set_trace()
         fixmatch_model = FixMatch(model,
                         num_classes,
                         args.ema_m,
