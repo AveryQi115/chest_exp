@@ -14,7 +14,8 @@ from loss import BCEWithLogitsLoss, get_category_list
 import moco.loader
 from ignite.contrib.metrics import ROC_AUC
 from train_utils import get_logger,TBLog, get_SGD,get_cosine_schedule_with_warmup
-# import ipdb
+from loss import consistency_loss
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -98,18 +99,18 @@ parser.add_argument('--fixmatch',action='store_true', help="use fixmatch to fine
 
 parser.add_argument('--uratio',type=float,default = 9.0,help="the number of unlabeled data to labeled data,9 is for 10% traindata")
 
-parser.add_argument('--num_train_iter', type=int, default=2**20, 
-                        help='total number of training iterations')
+# parser.add_argument('--num_train_iter', type=int, default=2**20, 
+#                         help='total number of training iterations')
 
-parser.add_argument('--train_sampler', type=str, default='RandomSampler')
+# parser.add_argument('--train_sampler', type=str, default='RandomSampler')
     
-parser.add_argument('--num_workers', type=int, default=1)
+# parser.add_argument('--num_workers', type=int, default=1)
 
 parser.add_argument('--hard_label', type=bool, default=True)
 
 parser.add_argument('--T', type=float, default=0.5)
 
-parser.add_argument('--ema_m', type=float, default=0.999, help='ema momentum for eval_model')
+# parser.add_argument('--ema_m', type=float, default=0.999, help='ema momentum for eval_model')
 
 parser.add_argument('--p_cutoff_pos', default=[0.95,0.95,0.95,0.95,0.95], nargs='*', type=float,
                     help='positive cutoff value for five classes')
@@ -122,7 +123,7 @@ parser.add_argument('--ulb_loss_ratio', type=float, default=1.0)
 parser.add_argument('--num_eval_iter', type=int, default=10000,
                         help='evaluation frequency')
 
-parser.add_argument('--amp', action='store_true', help='use mixed precision training or not')
+# parser.add_argument('--amp', action='store_true', help='use mixed precision training or not')
 
 parser.add_argument('--eval_batch_size', type=int, default=256,
                         help='batch size of evaluation data loader (it does not affect the accuracy)')
@@ -284,7 +285,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # train fixmatch load labeled_data, unlabeled_data, eval_data 
     if args.fixmatch:
-
         #SET save_path and logger
         save_path = args.store_path
         logger_level = "WARNING"
@@ -311,23 +311,25 @@ def main_worker(gpu, ngpus_per_node, args):
         loader_dict = {}
         dset_dict = {'train_lb': labeled_train_dataset, 'train_ulb': unlabeled_train_dataset, 'eval': test_dataset}
         
-        loader_dict['train_lb'] = get_data_loader(dset_dict['train_lb'],
-                                                args.batch_size,
-                                                data_sampler = args.train_sampler,
-                                                num_iters=args.num_train_iter,
-                                                num_workers=args.num_workers, 
-                                                distributed=args.distributed)
+        if args.distributed:
+            labeled_train_sampler = torch.utils.data.distributed.DistributedSampler(labeled_train_dataset)
+            unlabeled_train_sampler = torch.utils.data.distributed.DistributedSampler(unlabeled_train_dataset)
+        else:
+            labeled_train_sampler = None
+            unlabeled_train_sampler = None
+
+        loader_dict['train_lb'] = torch.utils.data.DataLoader(
+            dset_dict['train_lb'], batch_size=args.batch_size, shuffle=(labeled_train_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=labeled_train_sampler)
         
-        loader_dict['train_ulb'] = get_data_loader(dset_dict['train_ulb'],
-                                                args.batch_size*args.uratio,
-                                                data_sampler = args.train_sampler,
-                                                num_iters=args.num_train_iter,
-                                                num_workers=4*args.num_workers,
-                                                distributed=args.distributed)
+        loader_dict['train_ulb'] = torch.utils.data.DataLoader(
+            dset_dict['train_ulb'], batch_size=args.batch_size*args.uratio, shuffle=(unlabeled_train_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=unlabeled_train_sampler)
         
-        loader_dict['eval'] = get_data_loader(dset_dict['eval'],
-                                            args.eval_batch_size,
-                                            num_workers=args.num_workers)
+        loader_dict['eval'] = torch.utils.data.DataLoader(
+            dset_dict['eval'],
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
     
         num_classes = labeled_train_dataset.get_num_classes()
         annotations = labeled_train_dataset.get_annotations()
@@ -406,48 +408,43 @@ def main_worker(gpu, ngpus_per_node, args):
                 if epoch == args.start_epoch and not args.finetune:
                     sanity_check(model.state_dict(), args.pretrained)
     else:
-        # SET FixMatch: class FixMatch in models.fixmatch
-        # TODO: backbone bn_momentum should be set by ema_m
-        # args.bn_momentum = 1.0 - args.ema_m
-        
-        # SET Optimizer & LR Scheduler
-        ## construct SGD and cosine lr scheduler
-        optimizer = get_SGD(model, 'SGD', args.lr, args.momentum, args.weight_decay)
-        scheduler = get_cosine_schedule_with_warmup(optimizer,
-                                                args.num_train_iter,
-                                                num_warmup_steps=args.num_train_iter*0)
+        print_fn = print if logger is None else logger.info
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                labeled_train_sampler.set_epoch(epoch)
+                unlabeled_train_sampler.set_epoch(epoch)
 
-        # ipdb.set_trace()
-        fixmatch_model = FixMatch(model,
-                        num_classes,
-                        args.ema_m,
-                        args.T,
-                        args.p_cutoff_pos,
-                        args.p_cutoff_neg,
-                        args.ulb_loss_ratio,
-                        labeled_criterion,
-                        unlabeled_criterion,
-                        args.hard_label,
-                        num_eval_iter=args.num_eval_iter,
-                        tb_log=tb_log,
-                        logger=logger)
+            adjust_learning_rate(optimizer, epoch, args)
 
-        ## set SGD and cosine lr on FixMatch 
-        fixmatch_model.set_optimizer(optimizer, scheduler)
+            # train for one epoch
+            tb_dict = fixmatch_train(loader_dict, model, labeled_criterion, unlabeled_criterion, optimizer, epoch, args)
 
-        ## set DataLoader on FixMatch
-        fixmatch_model.set_data_loader(loader_dict)
+            acc1,auc_dict = fixmatch_validate(loader_dict, model, labeled_criterion, args, num_classes)
 
-        # START TRAINING of FixMatch
-        trainer = fixmatch_model.train
-        for epoch in range(args.epochs):
-            trainer(args, logger=logger)
-            
-        if not args.multiprocessing_distributed or \
-                    (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-            fixmatch_model.save_model('latest_model.pth', args.store_path)
-            
-        logging.warning(f"GPU {args.rank} training is FINISHED")
+            # remember best acc@1 and save checkpoint
+            is_best = acc1['eval/auc'] > best_acc1
+            best_acc1 = max(acc1['eval/auc'], best_acc1)
+
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                checkpoint_dict = {
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'best_auc': best_acc1,
+                    'optimizer' : optimizer.state_dict(),
+                }
+                for i, auc in enumerate(auc_dict['eval/auc_list']):
+                    checkpoint_dict['auc'+str(i)] = auc
+
+                save_checkpoint(checkpoint_dict, is_best, args.store_path+'checkpoint.pth.tar')
+                if epoch == args.start_epoch and not args.finetune:
+                    sanity_check(model.state_dict(), args.pretrained)
+
+            print_fn(f"Epochs:{epoch:3},  SUP_LOSS:{tb_dict['train/sup_loss']:6.4f}, UNSUP_LOSS:{tb_dict['train/unsup_loss']:6.4f}")
+            print_fn(f"Epochs:{epoch:3},  MASK_RATIO:{tb_dict['train/mask_ratio']}, BEST_EVAL_ACC: {best_acc1}")
+            print_fn(f"Epochs:{epoch:3},  AUC_list:{auc_dict['eval/auc_list']}")
+
 
 
 
@@ -553,6 +550,91 @@ def train(train_loader, model, criterion, optimizer, epoch, args, num_classes):
         )
         print(pbar_str)
 
+def fixmatch_train(loader_dict, model, labeled_criterion, unlabeled_criterion, optimizer, epoch, args):
+    model.train()
+    for (x_lb, y_lb), (x_ulb_s, x_ulb_w, _) in zip(loader_dict['train_lb'], loader_dict['train_ulb']):
+        num_lb = x_lb.shape[0]
+        num_ulb = x_ulb_w.shape[0]
+        assert num_ulb == x_ulb_s.shape[0]
+        
+        x_lb, x_ulb_w, x_ulb_s = x_lb.cuda(args.gpu), x_ulb_w.cuda(args.gpu), x_ulb_s.cuda(args.gpu)
+        y_lb = y_lb.cuda(args.gpu)
+        inputs = torch.cat((x_lb, x_ulb_w, x_ulb_s))
+
+        # inference and calculate sup/unsup losses
+        logits = model(inputs)
+        logits_x_lb = logits[:num_lb]
+        logits_x_ulb_w, logits_x_ulb_s = logits[num_lb:].chunk(2)
+        del logits
+        # self.print_fn(f'{self.it}: get logits output done')
+
+        # hyper-params for update
+        T = args.T
+        p_cutoff_pos = args.p_cutoff_pos
+        p_cutoff_neg = args.p_cutoff_neg
+
+        sup_loss = labeled_criterion(args, logits_x_lb, y_lb)
+        # self.print_fn(f'{self.it}: get supervised loss done')
+
+        unsup_loss, mask = consistency_loss(args,
+                                        logits_x_ulb_w, 
+                                        logits_x_ulb_s,
+                                        unlabeled_criterion,
+                                        p_cutoff_pos,
+                                        p_cutoff_neg,
+                                        'BCE', T, 
+                                        use_hard_labels=args.hard_label)
+
+        # self.print_fn(f'{self.it}: get unsupervised loss done')                               
+
+        total_loss = sup_loss + args.lambda_u * unsup_loss
+        
+        # parameter updates
+        total_loss.backward()
+        # self.print_fn(f'{self.it}: backward done')
+        optimizer.step()
+        model.zero_grad()
+        
+        #tensorboard_dict update
+        tb_dict = {}
+        tb_dict['train/sup_loss'] = sup_loss.detach() 
+        tb_dict['train/unsup_loss'] = unsup_loss.detach() 
+        tb_dict['train/total_loss'] = total_loss.detach() 
+        tb_dict['train/mask_ratio'] = 1.0 - mask.detach() 
+        tb_dict['lr'] = optimizer.param_groups[0]['lr']
+
+        return tb_dict
+
+def fixmatch_validate(loader_dict, model, labeled_criterion, args, num_classes):
+    eval_model = model
+    eval_model.eval()
+    
+    eval_loader = loader_dict['eval']
+    
+    total_loss = 0.0
+    total_num = 0.0
+    roc_auc = ROC_AUC(activated_output_transform)
+    roc_auc.reset()
+    roc_auc_list = []
+    for i in range(num_classes):
+        roc_auc_list.append(ROC_AUC(activated_output_transform))
+        roc_auc_list[-1].reset()
+
+    for x, y in eval_loader:
+        x, y = x.cuda(args.gpu), y.cuda(args.gpu)
+        num_batch = x.shape[0]
+        total_num += num_batch
+        logits = eval_model(x)
+        
+        loss = labeled_criterion(args, logits, y)
+        
+        roc_auc.update((logits.data,y.data))
+        for j in range(num_classes):
+            roc_auc_list[j].update((logits.data[:,j],y.data[:,j]))
+        
+        total_loss += loss.detach()*num_batch
+        
+    return {'eval/loss': total_loss/total_num, 'eval/auc': roc_auc.compute()},{'eval/auc_list':np.array([x.compute() for x in roc_auc_list])}
 
 def validate(val_loader, model, criterion, args,num_classes):
     batch_time = AverageMeter('Time', ':6.3f')
