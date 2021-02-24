@@ -114,7 +114,7 @@ parser.add_argument('--ema_m', type=float, default=0.999, help='ema momentum for
 parser.add_argument('--p_cutoff_pos', default=[0.95,0.95,0.95,0.95,0.95], nargs='*', type=float,
                     help='positive cutoff value for five classes')
 
-parser.add_argument('--p_cutoff_neg', default=[0.2,0.2,0.2,0.2,0.2], nargs='*', type=float,
+parser.add_argument('--p_cutoff_neg', default=[0.05,0.05,0.05,0.05,0.05], nargs='*', type=float,
                     help='negative cutoff value for five classes')
 
 parser.add_argument('--ulb_loss_ratio', type=float, default=1.0)
